@@ -96,7 +96,10 @@ def validate_placement(
 
 
 def visualize_placement(
-    placement: torch.Tensor, benchmark: Benchmark, save_path: Optional[str] = None
+    placement: torch.Tensor,
+    benchmark: Benchmark,
+    save_path: Optional[str] = None,
+    plc=None,
 ):
     """
     Visualize placement (requires matplotlib).
@@ -105,6 +108,7 @@ def visualize_placement(
         placement: [num_macros, 2] positions
         benchmark: Benchmark data
         save_path: Optional path to save figure
+        plc: Optional PlacementCost object (enables net connectivity drawing)
     """
     try:
         import matplotlib.pyplot as plt
@@ -196,6 +200,36 @@ def visualize_placement(
             edgecolors="darkgreen",
             linewidths=0.3,
         )
+
+    # Draw net connections as star topology (average center → each pin)
+    if plc is not None and hasattr(plc, "nets"):
+        from matplotlib.collections import LineCollection
+
+        lines = []
+        for driver_name, sink_names in plc.nets.items():
+            if driver_name not in plc.mod_name_to_indices:
+                continue
+            coords = []
+            driver_idx = plc.mod_name_to_indices[driver_name]
+            dx, dy = plc.modules_w_pins[driver_idx].get_pos()
+            coords.append((dx, dy))
+            for sink_name in sink_names:
+                if sink_name not in plc.mod_name_to_indices:
+                    continue
+                sink_idx = plc.mod_name_to_indices[sink_name]
+                sx, sy = plc.modules_w_pins[sink_idx].get_pos()
+                coords.append((sx, sy))
+            if len(coords) < 2:
+                continue
+            avg_x = sum(c[0] for c in coords) / len(coords)
+            avg_y = sum(c[1] for c in coords) / len(coords)
+            for cx, cy in coords:
+                lines.append([(avg_x, avg_y), (cx, cy)])
+        if lines:
+            lc = LineCollection(
+                lines, colors="gray", alpha=0.05, linewidths=0.5, zorder=1
+            )
+            ax.add_collection(lc)
 
     ax.set_xlim(0, benchmark.canvas_width)
     ax.set_ylim(0, benchmark.canvas_height)
