@@ -87,7 +87,7 @@ class ConvexOptPlacer:
         # Try a range of anchor strengths. Higher lambda = smaller QP displacement,
         # closer to initial positions. We legalize each candidate and compare.
         candidates = []
-        for lam in [30.0, 200.0]:
+        for lam in [30.0, 100.0, 400.0]:
             self.lambda_anchor = lam
             pos_cand = self._qp_solve(pos.copy(), movable, sizes, benchmark, n_total, port_pos, cw, ch)
             pos_cand[:n_hard] = self._legalize(
