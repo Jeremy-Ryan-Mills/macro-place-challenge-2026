@@ -53,7 +53,7 @@ class ConvexOptPlacer:
         Number of SA refinement steps after legalization.
     """
 
-    def __init__(self, seed: int = 42, lambda_anchor: float = 30.0, sa_iters: int = 0):
+    def __init__(self, seed: int = 42, lambda_anchor: float = 30.0, sa_iters: int = 200_000):
         self.seed = seed
         self.lambda_anchor = lambda_anchor
         self.sa_iters = sa_iters
@@ -125,18 +125,24 @@ class ConvexOptPlacer:
 
         pos = best_pos
 
-        # SA refinement
+        # SA refinement — compare before/after by proxy cost and keep the better one.
         if self.sa_iters > 0:
-            pos[:n_hard] = self._sa_refine(
+            sa_result = self._sa_refine(
                 pos[:n_hard].copy(),
                 ~fixed_mask[:n_hard],
                 sizes[:n_hard],
                 benchmark,
                 n_hard,
                 n_total,
+                port_pos,
                 cw,
                 ch,
             )
+            sa_pos = pos.copy()
+            sa_pos[:n_hard] = sa_result
+            sa_cost = self._fast_proxy(sa_pos, benchmark, n_total, port_pos)
+            if sa_cost < best_cost:
+                pos = sa_pos
 
         return torch.tensor(pos, dtype=torch.float32)
 
@@ -155,8 +161,10 @@ class ConvexOptPlacer:
         return wl + 0.5 * density
 
     def _fast_hpwl(self, pos, benchmark, n_total, port_pos):
-        """Normalized HPWL over all nets (approximates plc.get_cost())."""
-        canvas_area = benchmark.canvas_width * benchmark.canvas_height
+        """Normalized HPWL over all nets — same normalization as plc.get_cost():
+        total_wirelength / ((canvas_width + canvas_height) * net_count).
+        """
+        norm = (benchmark.canvas_width + benchmark.canvas_height) * benchmark.num_nets
         total = 0.0
         for net_i, nodes_tensor in enumerate(benchmark.net_nodes):
             nodes = nodes_tensor.numpy()
@@ -174,7 +182,7 @@ class ConvexOptPlacer:
                         ys.append(port_pos[p, 1])
             if len(xs) >= 2:
                 total += w * (max(xs) - min(xs) + max(ys) - min(ys))
-        return total / canvas_area
+        return total / norm
 
     def _fast_density(self, pos, benchmark):
         """
@@ -192,8 +200,9 @@ class ConvexOptPlacer:
         sizes = benchmark.macro_sizes.numpy().astype(np.float64)
 
         density_grid = np.zeros(rows * cols, dtype=np.float64)
+        n_total_macros = benchmark.num_macros  # hard + soft
 
-        for i in range(n_hard):
+        for i in range(n_total_macros):
             x, y = pos[i, 0], pos[i, 1]
             hw, hh = sizes[i, 0] / 2, sizes[i, 1] / 2
             xl, xr = x - hw, x + hw
@@ -412,14 +421,18 @@ class ConvexOptPlacer:
 
     # SA Refinement
 
-    def _sa_refine(self, pos, movable, sizes, benchmark, n_hard, n_total, cw, ch):
+    def _sa_refine(self, pos, movable, sizes, benchmark, n_hard, n_total, port_pos, cw, ch):
         """
-        Simulated annealing on weighted Manhattan wirelength (hard-hard edges).
+        Simulated annealing on combined WL + density cost.
 
-        Move types (equal probability):
-          - Shift: Gaussian random displacement, scaled by temperature
-          - Swap: exchange with a neighbor macro (connectivity-biased)
-          - Pull: move fraction of the way toward a connected macro
+        Cost = WL(hard↔hard, hard↔soft, hard↔port) + w_dens * sum_of_squares(density_grid)
+
+        WL uses O(degree) incremental delta updates.
+        Density uses an incrementally-maintained grid (soft macros fixed, hard macros movable).
+        w_dens is set so that density contributes ~50% of the initial total cost,
+        preventing SA from clustering macros to reduce WL at the expense of density.
+
+        Move types: Shift (45%), Swap (30%), Pull (25%)
         """
         half_w = sizes[:, 0] / 2
         half_h = sizes[:, 1] / 2
@@ -430,44 +443,159 @@ class ConvexOptPlacer:
         if len(movable_idx) == 0:
             return pos
 
-        # Build hard-macro-only weighted edges
-        edge_dict: dict = {}
+        # ── Build weighted adjacency: hard-macro ↔ {hard macro, soft macro, port} ──
+        #
+        # Each entry: (endpoint_x, endpoint_y, weight)
+        # For hard-macro endpoints we store their index so we can look up pos[idx]
+        # dynamically.  For fixed endpoints (soft macros, ports) we snapshot their
+        # positions once — they never move during SA.
+        #
+        # adj_hard[i]  = list of (hard_macro_j_index, weight)   — movable ends
+        # adj_fixed[i] = list of (fixed_x, fixed_y, weight)     — immovable ends
+
+        all_macro_pos = benchmark.macro_positions.numpy().astype(np.float64)
+        adj_hard:  list = [[] for _ in range(n_hard)]  # (j, w) pairs
+        adj_fixed: list = [[] for _ in range(n_hard)]  # (x, y, w) triples
+
         for net_i, nodes_tensor in enumerate(benchmark.net_nodes):
-            nodes = [int(n) for n in nodes_tensor.numpy() if n < n_hard]
-            if len(nodes) < 2:
-                continue
+            raw = nodes_tensor.numpy().tolist()
             w = float(benchmark.net_weights[net_i])
-            k = len(nodes)
-            if k > MAX_CLIQUE_SIZE:
-                anchor = nodes[0]
-                for j in nodes[1:]:
+            hard_nodes = [int(n) for n in raw if n < n_hard]
+            if len(hard_nodes) < 1:
+                continue
+
+            # Fixed endpoints on this net: soft macros + ports
+            fixed_pts = []
+            for n in raw:
+                n = int(n)
+                if n_hard <= n < n_total:
+                    # soft macro — use initial (fixed) position
+                    fixed_pts.append((all_macro_pos[n, 0], all_macro_pos[n, 1]))
+                elif n >= n_total:
+                    p = n - n_total
+                    if p < len(port_pos):
+                        fixed_pts.append((port_pos[p, 0], port_pos[p, 1]))
+
+            k_h = len(hard_nodes)
+            k_f = len(fixed_pts)
+            k_total = k_h + k_f
+
+            if k_total < 2:
+                continue
+
+            # Generate weighted edges (clique or star for large nets)
+            if k_total > MAX_CLIQUE_SIZE:
+                # Star model: hard anchor → all others
+                anchor = hard_nodes[0]
+                ew = w / (k_total - 1)
+                for j in hard_nodes[1:]:
                     a, b = (anchor, j) if anchor < j else (j, anchor)
-                    edge_dict[(a, b)] = edge_dict.get((a, b), 0.0) + w / (k - 1)
+                    # Record as hard–hard edge
+                    adj_hard[a].append((b, ew))
+                    adj_hard[b].append((a, ew))
+                for fx, fy in fixed_pts:
+                    adj_fixed[anchor].append((fx, fy, ew))
             else:
-                ew = w / (k - 1)
-                for a in range(k):
-                    for b in range(a + 1, k):
-                        ni, nj = nodes[a], nodes[b]
-                        if ni > nj:
-                            ni, nj = nj, ni
-                        edge_dict[(ni, nj)] = edge_dict.get((ni, nj), 0.0) + ew
+                ew = 2.0 * w / (k_total * (k_total - 1))
+                # hard–hard edges
+                for ai in range(k_h):
+                    for bi in range(ai + 1, k_h):
+                        ni, nj = hard_nodes[ai], hard_nodes[bi]
+                        adj_hard[ni].append((nj, ew))
+                        adj_hard[nj].append((ni, ew))
+                # hard–fixed edges
+                for ni in hard_nodes:
+                    for fx, fy in fixed_pts:
+                        adj_fixed[ni].append((fx, fy, ew))
 
-        if not edge_dict:
-            return pos
+        # Collapse into numpy arrays per macro for fast vectorised delta computation
+        macro_hard_j:  list = []   # macro_hard_j[i]  = int32 array of hard neighbours
+        macro_hard_w:  list = []   # macro_hard_w[i]  = float64 weights
+        macro_fixed_x: list = []   # macro_fixed_x[i] = float64 array of fixed x coords
+        macro_fixed_y: list = []
+        macro_fixed_w: list = []
 
-        edges = np.array(list(edge_dict.keys()), dtype=np.int32)  # [E, 2]
-        ew = np.array(list(edge_dict.values()), dtype=np.float64)  # [E]
+        for i in range(n_hard):
+            if adj_hard[i]:
+                js, ws = zip(*adj_hard[i])
+                macro_hard_j.append(np.array(js, dtype=np.int32))
+                macro_hard_w.append(np.array(ws, dtype=np.float64))
+            else:
+                macro_hard_j.append(np.empty(0, dtype=np.int32))
+                macro_hard_w.append(np.empty(0, dtype=np.float64))
 
-        # Neighbor list for connectivity-biased moves
-        neighbors: list = [[] for _ in range(n_hard)]
-        for ni, nj in edge_dict:
-            neighbors[ni].append(nj)
-            neighbors[nj].append(ni)
+            if adj_fixed[i]:
+                fxs, fys, fws = zip(*adj_fixed[i])
+                macro_fixed_x.append(np.array(fxs, dtype=np.float64))
+                macro_fixed_y.append(np.array(fys, dtype=np.float64))
+                macro_fixed_w.append(np.array(fws, dtype=np.float64))
+            else:
+                macro_fixed_x.append(np.empty(0, dtype=np.float64))
+                macro_fixed_y.append(np.empty(0, dtype=np.float64))
+                macro_fixed_w.append(np.empty(0, dtype=np.float64))
 
-        def wl_cost():
-            dx = np.abs(pos[edges[:, 0], 0] - pos[edges[:, 1], 0])
-            dy = np.abs(pos[edges[:, 0], 1] - pos[edges[:, 1], 1])
-            return (ew * (dx + dy)).sum()
+        # Neighbour list (hard–hard only) for connectivity-biased swap/pull moves
+        neighbors: list = [list(macro_hard_j[i]) for i in range(n_hard)]
+
+        # ── WL delta helpers ─────────────────────────────────────────────────────
+
+        def delta_move(i, ox, oy, nx, ny) -> float:
+            """
+            Cost delta for moving macro i from (ox,oy) to (nx,ny).
+            Handles both hard-neighbour and fixed-endpoint contributions.
+            Also accounts for the change seen from i's hard neighbours (their
+            edge to i changes too — captured via symmetric adjacency).
+            """
+            delta = 0.0
+            # Hard neighbours of i: edge (i,j) — counted from i's side
+            if len(macro_hard_j[i]):
+                js = macro_hard_j[i]
+                ox_arr = pos[js, 0]
+                oy_arr = pos[js, 1]
+                delta += float((macro_hard_w[i] * (
+                    np.abs(nx - ox_arr) + np.abs(ny - oy_arr) -
+                    np.abs(ox - ox_arr) - np.abs(oy - oy_arr)
+                )).sum())
+            # Fixed endpoints of i
+            if len(macro_fixed_x[i]):
+                delta += float((macro_fixed_w[i] * (
+                    np.abs(nx - macro_fixed_x[i]) + np.abs(ny - macro_fixed_y[i]) -
+                    np.abs(ox - macro_fixed_x[i]) - np.abs(oy - macro_fixed_y[i])
+                )).sum())
+            return delta
+
+        def delta_swap_wl(i, j, ox_i, oy_i, ox_j, oy_j) -> float:
+            """WL delta for swapping i and j (call AFTER applying swap in pos)."""
+            nx_i, ny_i = pos[i, 0], pos[i, 1]
+            nx_j, ny_j = pos[j, 0], pos[j, 1]
+            delta = 0.0
+            if len(macro_hard_j[i]):
+                js = macro_hard_j[i]; mask = js != j
+                js_f, w_f = js[mask], macro_hard_w[i][mask]
+                if len(js_f):
+                    delta += float((w_f * (
+                        np.abs(nx_i - pos[js_f, 0]) + np.abs(ny_i - pos[js_f, 1]) -
+                        np.abs(ox_i - pos[js_f, 0]) - np.abs(oy_i - pos[js_f, 1])
+                    )).sum())
+            if len(macro_fixed_x[i]):
+                delta += float((macro_fixed_w[i] * (
+                    np.abs(nx_i - macro_fixed_x[i]) + np.abs(ny_i - macro_fixed_y[i]) -
+                    np.abs(ox_i - macro_fixed_x[i]) - np.abs(oy_i - macro_fixed_y[i])
+                )).sum())
+            if len(macro_hard_j[j]):
+                js = macro_hard_j[j]; mask = js != i
+                js_f, w_f = js[mask], macro_hard_w[j][mask]
+                if len(js_f):
+                    delta += float((w_f * (
+                        np.abs(nx_j - pos[js_f, 0]) + np.abs(ny_j - pos[js_f, 1]) -
+                        np.abs(ox_j - pos[js_f, 0]) - np.abs(oy_j - pos[js_f, 1])
+                    )).sum())
+            if len(macro_fixed_x[j]):
+                delta += float((macro_fixed_w[j] * (
+                    np.abs(nx_j - macro_fixed_x[j]) + np.abs(ny_j - macro_fixed_y[j]) -
+                    np.abs(ox_j - macro_fixed_x[j]) - np.abs(oy_j - macro_fixed_y[j])
+                )).sum())
+            return delta
 
         def has_overlap(idx):
             gap = 0.05
@@ -477,12 +605,97 @@ class ConvexOptPlacer:
             ov[idx] = False
             return ov.any()
 
-        current_cost = wl_cost()
-        best_pos = pos.copy()
+        # ── Incremental density grid ─────────────────────────────────────────
+        #
+        # Tracks macro area coverage per grid cell.  Soft macros contribute a
+        # fixed baseline; only hard macro movements update the grid.  We use
+        # sum-of-squares as the density penalty: cheap to update incrementally
+        # and strongly penalises hotspots.
+
+        cols_d = benchmark.grid_cols
+        rows_d = benchmark.grid_rows
+        cell_w_d = cw / cols_d
+        cell_h_d = ch / rows_d
+        cell_area_d = cell_w_d * cell_h_d
+        all_sizes_d = benchmark.macro_sizes.numpy().astype(np.float64)
+
+        def _cells(x, y, mw, mh):
+            hw_, hh_ = mw / 2, mh / 2
+            xl_, xr_ = x - hw_, x + hw_
+            yl_, yr_ = y - hh_, y + hh_
+            c_s = max(0, int(xl_ / cell_w_d))
+            c_e = min(cols_d - 1, int(xr_ / cell_w_d))
+            r_s = max(0, int(yl_ / cell_h_d))
+            r_e = min(rows_d - 1, int(yr_ / cell_h_d))
+            result = []
+            for r in range(r_s, r_e + 1):
+                oy_ = max(0.0, min(yr_, (r + 1) * cell_h_d) - max(yl_, r * cell_h_d))
+                if oy_ <= 0:
+                    continue
+                for c in range(c_s, c_e + 1):
+                    ox_ = max(0.0, min(xr_, (c + 1) * cell_w_d) - max(xl_, c * cell_w_d))
+                    if ox_ > 0:
+                        result.append((r * cols_d + c, ox_ * oy_ / cell_area_d))
+            return result
+
+        density_grid = np.zeros(rows_d * cols_d, dtype=np.float64)
+        for i_sm in range(n_hard, benchmark.num_macros):   # soft macros (fixed)
+            for cell, frac in _cells(all_macro_pos[i_sm, 0], all_macro_pos[i_sm, 1],
+                                     all_sizes_d[i_sm, 0], all_sizes_d[i_sm, 1]):
+                density_grid[cell] += frac
+        for i_hm in range(n_hard):                         # hard macros (current pos)
+            for cell, frac in _cells(pos[i_hm, 0], pos[i_hm, 1],
+                                     sizes[i_hm, 0], sizes[i_hm, 1]):
+                density_grid[cell] += frac
+
+        def _dens_changes(x_old, y_old, x_new, y_new, mw, mh):
+            """Dict of {cell: net_density_change} for one macro move."""
+            ch_dict = {}
+            for cell, f in _cells(x_old, y_old, mw, mh):
+                ch_dict[cell] = ch_dict.get(cell, 0.0) - f
+            for cell, f in _cells(x_new, y_new, mw, mh):
+                ch_dict[cell] = ch_dict.get(cell, 0.0) + f
+            return ch_dict
+
+        def _delta_sos(ch_dict):
+            """Delta in sum-of-squares density for a given change dict."""
+            d = 0.0
+            for cell, dc in ch_dict.items():
+                dg = density_grid[cell]
+                d += (dg + dc) ** 2 - dg ** 2
+            return d
+
+        def _apply_changes(ch_dict):
+            for cell, dc in ch_dict.items():
+                density_grid[cell] += dc
+
+        # ── Initialise combined cost ─────────────────────────────────────────
+
+        init_wl = 0.0
+        for i_c in range(n_hard):
+            if len(macro_hard_j[i_c]):
+                js = macro_hard_j[i_c]
+                init_wl += float((macro_hard_w[i_c] * (
+                    np.abs(pos[i_c, 0] - pos[js, 0]) + np.abs(pos[i_c, 1] - pos[js, 1])
+                )).sum())
+            if len(macro_fixed_x[i_c]):
+                init_wl += float((macro_fixed_w[i_c] * (
+                    np.abs(pos[i_c, 0] - macro_fixed_x[i_c]) +
+                    np.abs(pos[i_c, 1] - macro_fixed_y[i_c])
+                )).sum())
+
+        init_sos = float((density_grid ** 2).sum())
+        # w_dens: weight so density starts contributing 50% of total cost
+        w_dens = (0.5 * init_wl / init_sos) if init_sos > 1e-12 else 0.0
+
+        current_wl  = init_wl
+        current_sos = init_sos
+        current_cost = current_wl + w_dens * current_sos
+        best_pos  = pos.copy()
         best_cost = current_cost
 
         T_start = max(cw, ch) * 0.10
-        T_end = max(cw, ch) * 0.001
+        T_end   = max(cw, ch) * 0.001
 
         for step in range(self.sa_iters):
             frac = step / self.sa_iters
@@ -491,86 +704,78 @@ class ConvexOptPlacer:
             move_type = random.random()
             i = int(random.choice(movable_idx))
             ox, oy = pos[i, 0], pos[i, 1]
+            j = None
+            ojx = ojy = 0.0
+            ch_dict = None
 
             if move_type < 0.45:
-                # Shift: Gaussian displacement scaled by temperature
+                # Shift
                 sigma = T * (0.2 + 0.8 * (1 - frac))
-                pos[i, 0] = np.clip(
-                    ox + random.gauss(0, sigma), half_w[i], cw - half_w[i]
-                )
-                pos[i, 1] = np.clip(
-                    oy + random.gauss(0, sigma), half_h[i], ch - half_h[i]
-                )
+                nx = np.clip(ox + random.gauss(0, sigma), half_w[i], cw - half_w[i])
+                ny = np.clip(oy + random.gauss(0, sigma), half_h[i], ch - half_h[i])
+                pos[i, 0] = nx; pos[i, 1] = ny
+                if has_overlap(i):
+                    pos[i, 0] = ox; pos[i, 1] = oy
+                    continue
+                delta_wl = delta_move(i, ox, oy, nx, ny)
+                ch_dict  = _dens_changes(ox, oy, nx, ny, sizes[i, 0], sizes[i, 1])
 
             elif move_type < 0.75:
-                # Swap: exchange positions (prefer connected neighbors)
+                # Swap (prefer connected neighbours)
                 if neighbors[i] and random.random() < 0.7:
-                    cands = [j for j in neighbors[i] if movable[j]]
-                    j = (
-                        int(random.choice(cands))
-                        if cands
-                        else int(random.choice(movable_idx))
-                    )
+                    cands = [nb for nb in neighbors[i] if movable[nb]]
+                    j = int(random.choice(cands)) if cands else int(random.choice(movable_idx))
                 else:
                     j = int(random.choice(movable_idx))
-
                 if i == j:
                     continue
                 ojx, ojy = pos[j, 0], pos[j, 1]
                 pos[i, 0] = np.clip(ojx, half_w[i], cw - half_w[i])
                 pos[i, 1] = np.clip(ojy, half_h[i], ch - half_h[i])
-                pos[j, 0] = np.clip(ox, half_w[j], cw - half_w[j])
-                pos[j, 1] = np.clip(oy, half_h[j], ch - half_h[j])
-
+                pos[j, 0] = np.clip(ox,  half_w[j], cw - half_w[j])
+                pos[j, 1] = np.clip(oy,  half_h[j], ch - half_h[j])
                 if has_overlap(i) or has_overlap(j):
-                    pos[i, 0] = ox
-                    pos[i, 1] = oy
-                    pos[j, 0] = ojx
-                    pos[j, 1] = ojy
+                    pos[i, 0] = ox;  pos[i, 1] = oy
+                    pos[j, 0] = ojx; pos[j, 1] = ojy
                     continue
-
-                new_cost = wl_cost()
-                delta = new_cost - current_cost
-                if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-10)):
-                    current_cost = new_cost
-                    if current_cost < best_cost:
-                        best_cost = current_cost
-                        best_pos = pos.copy()
-                else:
-                    pos[i, 0] = ox
-                    pos[i, 1] = oy
-                    pos[j, 0] = ojx
-                    pos[j, 1] = ojy
-                continue
+                delta_wl = delta_swap_wl(i, j, ox, oy, ojx, ojy)
+                # Merge both moves' density changes simultaneously
+                c1 = _dens_changes(ox, oy, pos[i, 0], pos[i, 1], sizes[i, 0], sizes[i, 1])
+                c2 = _dens_changes(ojx, ojy, pos[j, 0], pos[j, 1], sizes[j, 0], sizes[j, 1])
+                ch_dict = dict(c1)
+                for cell, dc in c2.items():
+                    ch_dict[cell] = ch_dict.get(cell, 0.0) + dc
 
             else:
-                # Pull: move toward a connected macro
+                # Pull toward a connected node
                 if not neighbors[i]:
                     continue
-                j = int(random.choice(neighbors[i]))
+                nb = int(random.choice(neighbors[i]))
                 alpha = random.uniform(0.05, 0.35)
-                pos[i, 0] = np.clip(
-                    ox + alpha * (pos[j, 0] - ox), half_w[i], cw - half_w[i]
-                )
-                pos[i, 1] = np.clip(
-                    oy + alpha * (pos[j, 1] - oy), half_h[i], ch - half_h[i]
-                )
+                nx = np.clip(ox + alpha * (pos[nb, 0] - ox), half_w[i], cw - half_w[i])
+                ny = np.clip(oy + alpha * (pos[nb, 1] - oy), half_h[i], ch - half_h[i])
+                pos[i, 0] = nx; pos[i, 1] = ny
+                if has_overlap(i):
+                    pos[i, 0] = ox; pos[i, 1] = oy
+                    continue
+                delta_wl = delta_move(i, ox, oy, nx, ny)
+                ch_dict  = _dens_changes(ox, oy, nx, ny, sizes[i, 0], sizes[i, 1])
 
-            # Overlap check for shift/pull moves
-            if has_overlap(i):
-                pos[i, 0] = ox
-                pos[i, 1] = oy
-                continue
+            delta_sos  = _delta_sos(ch_dict)
+            delta      = delta_wl + w_dens * delta_sos
 
-            new_cost = wl_cost()
-            delta = new_cost - current_cost
+            # Metropolis acceptance
             if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-10)):
-                current_cost = new_cost
+                current_wl  += delta_wl
+                current_sos += delta_sos
+                current_cost = current_wl + w_dens * current_sos
+                _apply_changes(ch_dict)
                 if current_cost < best_cost:
                     best_cost = current_cost
-                    best_pos = pos.copy()
+                    best_pos  = pos.copy()
             else:
-                pos[i, 0] = ox
-                pos[i, 1] = oy
+                pos[i, 0] = ox; pos[i, 1] = oy
+                if j is not None:
+                    pos[j, 0] = ojx; pos[j, 1] = ojy
 
         return best_pos
