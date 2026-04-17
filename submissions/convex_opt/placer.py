@@ -349,9 +349,13 @@ class ConvexOptPlacer:
         """
         Minimum-displacement legalization for hard macros.
 
-        Processes macros largest-area-first. For each macro, searches
-        outward from its QP position in expanding grid rings until a
-        position is found that has no overlap with already-placed macros.
+        Two-phase search:
+          1. Coarse ring search (step = max(w,h)*0.25) to locate the first
+             ring that contains a legal position.
+          2. Fine-grained local search within ±coarse_step of the best
+             coarse position, using step = min(w,h)*0.08 (≥0.03 μm floor).
+             This tightens the final placement toward the true nearest legal
+             point without iterating many small rings from the origin.
         """
         half_w = sizes[:, 0] / 2
         half_h = sizes[:, 1] / 2
@@ -363,56 +367,73 @@ class ConvexOptPlacer:
         placed = np.zeros(n, dtype=bool)
         legal = pos.copy()
 
+        def _no_conflict(cx, cy, idx):
+            if not placed.any():
+                return True
+            dx = np.abs(cx - legal[:, 0])
+            dy = np.abs(cy - legal[:, 1])
+            c = (dx < sep_x[idx] + 0.05) & (dy < sep_y[idx] + 0.05) & placed
+            c[idx] = False
+            return not c.any()
+
         for idx in order:
             if not movable[idx]:
                 placed[idx] = True
                 continue
 
             # Check if current position is already legal
-            if placed.any():
-                dx = np.abs(legal[idx, 0] - legal[:, 0])
-                dy = np.abs(legal[idx, 1] - legal[:, 1])
-                conflict = (dx < sep_x[idx] + 0.05) & (dy < sep_y[idx] + 0.05) & placed
-                conflict[idx] = False
-                if not conflict.any():
-                    placed[idx] = True
-                    continue
+            if _no_conflict(legal[idx, 0], legal[idx, 1], idx):
+                placed[idx] = True
+                continue
 
-            # Search outward from QP position
-            step = max(sizes[idx, 0], sizes[idx, 1]) * 0.25
+            # ── Phase 1: coarse ring search ──────────────────────────────────
+            step_c = max(sizes[idx, 0], sizes[idx, 1]) * 0.25
             best_p = legal[idx].copy()
             best_d = float("inf")
+            found_ring = False
 
             for r in range(1, 200):
-                found = False
                 for dxr in range(-r, r + 1):
                     for dyr in range(-r, r + 1):
                         if abs(dxr) != r and abs(dyr) != r:
-                            continue  # Only ring perimeter
-                        cx = np.clip(
-                            pos[idx, 0] + dxr * step, half_w[idx], cw - half_w[idx]
-                        )
-                        cy = np.clip(
-                            pos[idx, 1] + dyr * step, half_h[idx], ch - half_h[idx]
-                        )
-                        if placed.any():
-                            dx = np.abs(cx - legal[:, 0])
-                            dy = np.abs(cy - legal[:, 1])
-                            c = (
-                                (dx < sep_x[idx] + 0.05)
-                                & (dy < sep_y[idx] + 0.05)
-                                & placed
-                            )
-                            c[idx] = False
-                            if c.any():
-                                continue
+                            continue
+                        cx = np.clip(pos[idx, 0] + dxr * step_c,
+                                     half_w[idx], cw - half_w[idx])
+                        cy = np.clip(pos[idx, 1] + dyr * step_c,
+                                     half_h[idx], ch - half_h[idx])
+                        if not _no_conflict(cx, cy, idx):
+                            continue
                         d = (cx - pos[idx, 0]) ** 2 + (cy - pos[idx, 1]) ** 2
                         if d < best_d:
                             best_d = d
                             best_p = np.array([cx, cy])
-                            found = True
-                if found:
+                            found_ring = True
+                if found_ring:
                     break
+
+            # ── Phase 2: fine-grained local refinement ───────────────────────
+            # Scan a dense grid within ±step_c of the best coarse position.
+            # This finds the true nearest legal point on a sub-coarse grid.
+            step_f = max(min(sizes[idx, 0], sizes[idx, 1]) * 0.08, 0.03)
+            x_lo = max(half_w[idx],      best_p[0] - step_c)
+            x_hi = min(cw - half_w[idx], best_p[0] + step_c)
+            y_lo = max(half_h[idx],      best_p[1] - step_c)
+            y_hi = min(ch - half_h[idx], best_p[1] + step_c)
+
+            # Cap fine grid to ≤ 40 × 40 points to bound runtime
+            n_x = min(40, max(1, int((x_hi - x_lo) / step_f) + 1))
+            n_y = min(40, max(1, int((y_hi - y_lo) / step_f) + 1))
+            xs = np.linspace(x_lo, x_hi, n_x)
+            ys = np.linspace(y_lo, y_hi, n_y)
+
+            for cx in xs:
+                for cy in ys:
+                    if not _no_conflict(cx, cy, idx):
+                        continue
+                    d = (cx - pos[idx, 0]) ** 2 + (cy - pos[idx, 1]) ** 2
+                    if d < best_d:
+                        best_d = d
+                        best_p = np.array([cx, cy])
 
             legal[idx] = best_p
             placed[idx] = True
