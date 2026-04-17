@@ -81,45 +81,49 @@ class ConvexOptPlacer:
         movable = np.zeros(n_total, dtype=bool)
         movable[:n_hard] = ~fixed_mask[:n_hard]
 
-        #  QP solve with multiple lambda values
-        # Try a range of anchor strengths. Higher lambda = smaller QP displacement,
-        # closer to initial positions. We legalize each candidate and compare.
-        candidates = []
-        for lam in [30.0, 100.0, 400.0]:
-            self.lambda_anchor = lam
-            pos_cand = self._qp_solve(
-                pos.copy(), movable, sizes, benchmark, n_total, port_pos, cw, ch
-            )
-            pos_cand[:n_hard] = self._legalize(
-                pos_cand[:n_hard].copy(),
-                ~fixed_mask[:n_hard],
-                sizes[:n_hard],
-                cw,
-                ch,
-            )
-            candidates.append(
-                (self._fast_proxy(pos_cand, benchmark, n_total, port_pos), pos_cand)
-            )
-        self.lambda_anchor = 30.0  # restore default
+        def _qp_legalize_candidates(anchor_pos, lambdas):
+            """Run QP+legalize for each lambda, return list of (cost, pos)."""
+            cands = []
+            for lam in lambdas:
+                self.lambda_anchor = lam
+                p = self._qp_solve(
+                    anchor_pos.copy(), movable, sizes, benchmark, n_total, port_pos, cw, ch
+                )
+                p[:n_hard] = self._legalize(
+                    p[:n_hard].copy(), ~fixed_mask[:n_hard], sizes[:n_hard], cw, ch
+                )
+                cands.append((self._fast_proxy(p, benchmark, n_total, port_pos), p))
+            self.lambda_anchor = 30.0
+            return cands
 
-        # Also legalize the initial positions as a fallback
+        # Round 1: try a range of anchor strengths from the initial positions.
+        candidates = _qp_legalize_candidates(pos, [30.0, 100.0, 400.0])
+
+        # Also legalize the initial positions as a fallback.
         pos_init_legal = pos.copy()
         pos_init_legal[:n_hard] = self._legalize(
-            pos[:n_hard].copy(),
-            ~fixed_mask[:n_hard],
-            sizes[:n_hard],
-            cw,
-            ch,
+            pos[:n_hard].copy(), ~fixed_mask[:n_hard], sizes[:n_hard], cw, ch
         )
         candidates.append(
-            (
-                self._fast_proxy(pos_init_legal, benchmark, n_total, port_pos),
-                pos_init_legal,
-            )
+            (self._fast_proxy(pos_init_legal, benchmark, n_total, port_pos), pos_init_legal)
         )
 
-        # Pick the candidate with lowest approximate proxy cost
-        pos = min(candidates, key=lambda c: c[0])[1]
+        best_cost, best_pos = min(candidates, key=lambda c: c[0])
+
+        # Iterative refinement: use the best legal positions as the new anchor
+        # and re-run QP.  Each iteration, QP finds a WL minimum near a legal
+        # solution, then legalization nudges it back to feasibility — this
+        # feedback loop steadily improves quality.
+        for _ in range(2):
+            new_cands = _qp_legalize_candidates(best_pos, [30.0, 100.0, 400.0])
+            new_cost, new_pos = min(new_cands, key=lambda c: c[0])
+            if new_cost < best_cost:
+                best_cost = new_cost
+                best_pos = new_pos
+            else:
+                break  # no improvement — stop early
+
+        pos = best_pos
 
         # SA refinement
         if self.sa_iters > 0:
