@@ -224,9 +224,9 @@ Submissions are ranked by **average proxy cost** across all 17 IBM benchmarks (l
 
 | Rank | Team | Avg Proxy Cost | Best | Worst | Overlaps | Runtime | Verified | Notes |
 |------|------|---------------|------|-------|----------|---------|----------|-------|
-| 1 | "RoRa" (RipPlace) | **1.3241** | — | — | 0 | 694s/bench | | |
-| 2 | "Mike Gao" (autoresearch) | **1.3255** | — | — | 0 | 16min/bench | | |
-| 3 | "MTK" (DreamPlace++) | **1.3622** | 1.0040 | 1.6710 | 0 | 112s/bench (GPU) | :white_check_mark: | Verified better than self-reported 1.3998; faster GPU on eval hardware |
+| 1 | "MTK" (DreamPlace++) | **1.3170** | — | — | 0 | 42s/bench (GPU) | | Updated 4/15; previous version verified at 1.3622 |
+| 2 | "RoRa" (RipPlace) | **1.3241** | — | — | 0 | 694s/bench | | |
+| 3 | "Mike Gao" (autoresearch) | **1.3255** | — | — | 0 | 16min/bench | | |
 | 4 | "Electric Beatel" (ePlace-Lite) | **1.3913** | 0.9773 | 1.7253 | 0 | 155s/bench (GPU) | :white_check_mark: | |
 | 5 | "Varun's Parallel Worlds" (GRPlace) | **1.4017** | 1.0362 | 1.7298 | 0 | 27s/bench | :white_check_mark: | |
 | 6 | "BakaBobo" (Global Relocation Sweep) | **1.4044** | — | — | 0 | 282s/bench | | Updated from 1.4403 |
@@ -235,15 +235,17 @@ Submissions are ranked by **average proxy cost** across all 17 IBM benchmarks (l
 | 9 | "Convex Optimization" (UWaterloo Student) | **1.4556** | 1.0432 | 1.7867 | 0 | 11s/bench | :white_check_mark: | Resubmitted 4/13; fixed from DQ (was 846 overlaps) |
 | 10 | "another Waterloo kid" (Batched Nesterov GP) | **1.4568** | — | — | 0 | 118s/bench | | |
 | — | RePlAce (baseline) | **1.4578** | 0.9976 | 1.8370 | 0 | — | :white_check_mark: | |
-| 11 | "UTAUSTIN-CT" (PLC-Exact Congestion-Aware SA) | **1.5062** | 1.1363 | 1.7941 | 0 | 6s/bench | :white_check_mark: | |
-| 12 | "oracleX" (Oracle) | **1.5130** | 1.1340 | 1.7937 | 0 | 11s/bench | :white_check_mark: | |
-| 13 | "SEVmakers" (Hybrid Legalization + SA) | **1.5200** | — | — | 0 | 200s/bench | | |
-| 14 | "CA" (congestion_aware) | **1.5247** | 1.2226 | 1.7945 | 0 | 2s/bench | :white_check_mark: | Verified 1.5247 vs self-reported 1.5238 |
-| 15 | "#5 ubc cpen student" (Gene Pool Shuffle) | **1.5337** | 1.1411 | 1.8084 | 0 | 13s/bench | :white_check_mark: | |
-| 16 | Will Seed (Partcl) | **1.5338** | 1.1625 | 1.7965 | 0 | 35s total | :white_check_mark: | |
-| 17 | "Cezar" (CRISP) | **1.5781** | 1.1896 | 1.8520 | 0 | 4min/bench | :white_check_mark: | |
-| 18 | "UT Austin" - RH (DREAMPlace) | **1.6037** | — | — | 0 | 4.5s/bench | | |
-| 19 | "UT Austin" - CT (PROXYCost) | **1.8706** | — | — | 0 | 187s/bench | | |
+| 11 | "Jiangban Ya" (Min-Displacement Legalizer) | **1.4944** | — | — | 0 | 188s/bench | | |
+| 12 | "UTAUSTIN-CT" (PLC-Exact Congestion-Aware SA) | **1.5062** | 1.1363 | 1.7941 | 0 | 6s/bench | :white_check_mark: | |
+| 13 | "oracleX" (Oracle) | **1.5130** | 1.1340 | 1.7937 | 0 | 11s/bench | :white_check_mark: | |
+| 14 | "SEVmakers" (Hybrid Legalization + SA) | **1.5200** | — | — | 0 | 200s/bench | | |
+| 15 | "CA" (congestion_aware) | **1.5247** | 1.2226 | 1.7945 | 0 | 2s/bench | :white_check_mark: | Verified 1.5247 vs self-reported 1.5238 |
+| 16 | "#5 ubc cpen student" (Gene Pool Shuffle) | **1.5337** | 1.1411 | 1.8084 | 0 | 13s/bench | :white_check_mark: | |
+| 17 | Will Seed (Partcl) | **1.5338** | 1.1625 | 1.7965 | 0 | 35s total | :white_check_mark: | |
+| 18 | "Cezar" (CRISP) | **1.5781** | 1.1896 | 1.8520 | 0 | 4min/bench | :white_check_mark: | |
+| 19 | "UT Austin" - RH (DREAMPlace) | **1.6037** | — | — | 0 | 4.5s/bench | | |
+| 20 | "UT Austin" - CT (PROXYCost) | **1.8706** | — | — | 0 | 187s/bench | | |
+| 21 | "Sharc #1" (Auction Placer) | **2.0433** | — | — | 0 | 223s/bench | | |
 | — | SA (baseline) | 2.1251 | 1.3166 | 3.6726 | 0 | — | :white_check_mark: | |
 | — | Greedy Row (demo) | 2.2109 | 1.6728 | 2.7696 | 0 | 0.3s total | :white_check_mark: | |
 | — | "Binghamton" (feng shui) | pending | — | — | — | — | | |
