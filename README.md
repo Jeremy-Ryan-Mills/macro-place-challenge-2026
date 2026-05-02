@@ -6,6 +6,13 @@
 
 Partcl and Hudson River Trading are excited to co-host a competition to solve the macro placement problem. 
 
+## Our Submissions
+
+This repo contains two placer implementations competing in the challenge:
+
+- **`submissions/convex_opt/`** — Quadratic programming initial placement followed by RUDY-tracked simulated annealing. Achieves avg proxy **1.4556** (beats RePlAce baseline of 1.4578).
+- **`submissions/dreamplace/`** — DREAMPlace-style gradient descent (log-sum-exp WL + Gaussian density) with minimum-displacement legalization and RUDY SA refinement. Achieves avg proxy **~1.475**. Wins decisively on ibm10 and ibm12; runs in ~36s/benchmark.
+
 ## About Macro Placement
 
 Macro placement is the problem of positioning large fixed-size blocks (SRAMs, IPs, analog macros, etc.) on a chip floorplan so that routing congestion, timing, power delivery, and area constraints are balanced. Unlike standard-cell placement, macros have strong geometric and connectivity constraints, so the challenge is to explore a highly discrete design space while minimizing wirelength, avoiding blockages, and preserving downstream routability and timing quality.
